@@ -30,6 +30,7 @@
   };
   let charts = [];
   let ticker = null;
+  let pendingCsvImport = null;
 
   // ======================== 공통 ========================
   const $ = sel => document.querySelector(sel);
@@ -835,6 +836,7 @@
           <button class="btn" data-action="exportData">⬇ 백업 파일 내보내기</button>
           <label class="btn">⬆ 백업 파일 불러오기<input type="file" accept="application/json,.json" data-change="importData" hidden></label>
           <button class="btn" data-action="exportCsv">⬇ 기록 CSV 내보내기</button>
+          <label class="btn">⬆ 기록 CSV 추가<input type="file" accept=".csv,text/csv" data-change="importCsv" hidden></label>
           <button class="btn" data-action="loadSample">예시 데이터 추가</button>
           <button class="btn danger" data-action="resetData">전체 초기화</button>
         </div>
@@ -896,6 +898,146 @@
     }
     const csv = rows.map(row => row.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\r\n');
     U.download(`행동기록_${U.today()}.csv`, '﻿' + csv, 'text/csv;charset=utf-8');
+  }
+
+  // ---- CSV 기록 추가: 기존 CSV 내보내기 형식 및 확장된 16열 양식 지원 ----
+  function parseCsvText(text) {
+    text = String(text || '').replace(/^\uFEFF/, '');
+    const rows = [];
+    let row = [], cell = '', quoted = false;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (quoted) {
+        if (ch === '"' && text[i + 1] === '"') { cell += '"'; i++; }
+        else if (ch === '"') quoted = false;
+        else cell += ch;
+      } else if (ch === '"') quoted = true;
+      else if (ch === ',') { row.push(cell); cell = ''; }
+      else if (ch === '\n' || ch === '\r') {
+        if (ch === '\r' && text[i + 1] === '\n') i++;
+        row.push(cell); cell = '';
+        if (row.some(v => String(v).trim() !== '')) rows.push(row);
+        row = [];
+      } else cell += ch;
+    }
+    if (cell.length || row.length) { row.push(cell); if (row.some(v => String(v).trim() !== '')) rows.push(row); }
+    if (rows.length < 2) throw new Error('CSV에 가져올 기록이 없습니다.');
+    return { headers: rows[0].map(x => x.trim()), rows: rows.slice(1) };
+  }
+  function parseDateKey(value) {
+    const m = String(value || '').match(/(\d{4})[-/.년]\s*(\d{1,2})[-/.월]\s*(\d{1,2})/);
+    return m ? `${m[1]}-${U.pad(m[2])}-${U.pad(m[3])}` : '';
+  }
+  function parseClock(value) {
+    const s = String(value || '').trim();
+    if (!s) return '12:00';
+    const m = s.match(/(오전|오후)?\s*(\d{1,2}):(\d{2})/);
+    if (!m) return '12:00';
+    let h = Number(m[2]);
+    if (m[1] === '오후' && h < 12) h += 12;
+    if (m[1] === '오전' && h === 12) h = 0;
+    return `${U.pad(h)}:${m[3]}`;
+  }
+  function parseDuration(value, start, end) {
+    const s = String(value || '').trim();
+    if (s) {
+      if (/^\d+(\.\d+)?$/.test(s)) return Math.max(0, Math.round(Number(s)));
+      let total = 0, found = false, m;
+      const re = /(\d+(?:\.\d+)?)\s*(시간|시|분|초|h|m|s)/gi;
+      while ((m = re.exec(s))) {
+        found = true; const n = Number(m[1]);
+        total += n * (/시간|시|h/i.test(m[2]) ? 3600 : /분|m/i.test(m[2]) ? 60 : 1);
+      }
+      if (found) return Math.round(total);
+    }
+    if (start && end) {
+      const a = start.split(':').map(Number), b = end.split(':').map(Number);
+      let diff = (b[0] * 60 + b[1]) - (a[0] * 60 + a[1]);
+      if (diff < 0) diff += 1440;
+      if (diff > 0) return diff * 60;
+    }
+    return null;
+  }
+  function labelCodes(value, labels) {
+    const vals = String(value || '').split(/[;；,，]/).map(x => x.trim()).filter(Boolean);
+    const codes = [], unknown = [];
+    for (const val of vals) {
+      const found = Object.entries(labels).find(([code, label]) => label === val || val.includes(label) || label.includes(val));
+      if (found) { if (!codes.includes(found[0])) codes.push(found[0]); }
+      else unknown.push(val);
+    }
+    return { codes, unknown: unknown.join('; ') };
+  }
+  function functionCode(value) {
+    const v = String(value || '').trim();
+    if (/관심/.test(v)) return 'attention';
+    if (/회피|도피|과제/.test(v)) return 'escape';
+    if (/물건|활동|획득|요구/.test(v)) return 'tangible';
+    if (/감각|자동 강화/.test(v)) return 'sensory';
+    return '';
+  }
+  function rowValue(row, map, ...names) {
+    for (const name of names) { const i = map[name]; if (i != null && row[i] != null) return String(row[i]).trim(); }
+    return '';
+  }
+  function csvRowsToRecords(parsed) {
+    const normalized = parsed.headers.map(h => h.replace(/^\uFEFF/, '').trim());
+    const map = Object.fromEntries(normalized.map((h, i) => [h, i]));
+    const has = (...names) => names.some(n => map[n] != null);
+    if (!has('학생') || !has('표적행동') || !has('날짜')) throw new Error('학생, 표적행동, 날짜 열이 필요합니다. 사이트에서 내보낸 CSV 양식을 사용해 주세요.');
+    return parsed.rows.map((row, index) => {
+      const studentName = rowValue(row, map, '학생');
+      const behaviorName = rowValue(row, map, '표적행동');
+      const date = parseDateKey(rowValue(row, map, '날짜'));
+      const start = parseClock(rowValue(row, map, '시작시간', '시각'));
+      const end = parseClock(rowValue(row, map, '종료시간'));
+      const durationSec = parseDuration(rowValue(row, map, '지속시간(초)', '지속시간'), start, end);
+      const intensityRaw = rowValue(row, map, '강도');
+      const intensity = intensityRaw && Number.isFinite(Number(intensityRaw)) ? Number(intensityRaw) : null;
+      const setting = rowValue(row, map, '장소');
+      const activity = rowValue(row, map, '활동');
+      const ante = labelCodes(rowValue(row, map, '선행사건'), A.ANTE_LABELS);
+      const cons = labelCodes(rowValue(row, map, '후속결과'), A.CONS_LABELS);
+      const antecedentText = rowValue(row, map, '선행사건 상세');
+      const behaviorText = rowValue(row, map, '행동 묘사');
+      const consequenceText = rowValue(row, map, '후속결과 상세');
+      const guessText = rowValue(row, map, '추정 기능');
+      const notes = rowValue(row, map, '메모');
+      if (!studentName || !behaviorName || !date) return { invalid: true, line: index + 2, reason: '학생·표적행동·날짜 누락 또는 날짜 형식 오류' };
+      const ts = new Date(`${date}T${start}:00`);
+      if (Number.isNaN(ts.getTime())) return { invalid: true, line: index + 2, reason: '날짜 또는 시각 형식 오류' };
+      const abc = { setting, activity, antecedents: ante.codes, antecedentText: [antecedentText, ante.unknown].filter(Boolean).join(' / '), behaviorText, consequences: cons.codes, consequenceText: [consequenceText, cons.unknown].filter(Boolean).join(' / '), functionGuess: functionCode(guessText), notes };
+      const hasAbc = setting || activity || ante.codes.length || abc.antecedentText || behaviorText || cons.codes.length || abc.consequenceText || abc.functionGuess || notes;
+      return { studentName, behaviorName, date, start, end, durationSec, intensity, ts: ts.toISOString(), source: hasAbc ? 'abc' : 'frequency', abc: hasAbc ? abc : null, line: index + 2 };
+    });
+  }
+  function csvFingerprint(x) {
+    return [x.studentName, x.behaviorName, x.ts, x.durationSec == null ? '' : x.durationSec, x.intensity == null ? '' : x.intensity,
+      x.abc && x.abc.setting, x.abc && x.abc.activity, x.abc && x.abc.behaviorText, x.abc && x.abc.antecedentText, x.abc && x.abc.consequenceText].map(v => String(v || '').trim()).join('|');
+  }
+  function prepareCsvImport(file) {
+    file.text().then(text => {
+      try {
+        const parsed = parseCsvText(text);
+        const records = csvRowsToRecords(parsed);
+        const invalid = records.filter(x => x.invalid);
+        const valid = records.filter(x => !x.invalid);
+        const existing = new Set(S.data.records.map(r => {
+          const b = S.behavior(r.behaviorId), st = b && S.student(b.studentId);
+          return csvFingerprint({ studentName: st && st.name, behaviorName: b && b.name, ts: r.ts, durationSec: r.durationSec, intensity: r.intensity, abc: r.abc });
+        }));
+        const seen = new Set();
+        let duplicates = 0;
+        for (const x of valid) { const fp = csvFingerprint(x); if (existing.has(fp) || seen.has(fp)) duplicates++; else seen.add(fp); }
+        pendingCsvImport = { valid, invalid, duplicates };
+        openModal(`<h2>기록 CSV 가져오기 미리보기</h2>
+          <p>파일: <b>${esc(file.name)}</b></p>
+          <div class="card"><p>전체 행 <b>${records.length}건</b></p><p>추가 가능 <b>${Math.max(0, valid.length - duplicates)}건</b></p><p>중복 예상 <b>${duplicates}건</b> (추가하지 않음)</p><p>오류 행 <b>${invalid.length}건</b> (추가하지 않음)</p></div>
+          ${invalid.length ? `<p class="muted small">오류 예시: ${invalid.slice(0, 5).map(x => `행 ${x.line}: ${esc(x.reason)}`).join(' · ')}</p>` : ''}
+          <p class="muted small">학생이나 표적행동이 없으면 자동 생성합니다. 기존 기록은 삭제하거나 덮어쓰지 않습니다.</p>
+          <div class="row"><button class="btn primary" data-action="confirmCsvImport" ${valid.length - duplicates <= 0 ? 'disabled' : ''}>${Math.max(0, valid.length - duplicates)}건 추가</button><button class="btn" data-action="closeModal">취소</button></div>`);
+      } catch (e) { alert('CSV를 읽지 못했습니다: ' + e.message); }
+    }).catch(e => alert('파일을 읽지 못했습니다: ' + e.message));
   }
 
   // ======================== 이벤트 ========================
@@ -1050,6 +1192,35 @@
 
     exportData() { U.download(`행동중재도우미_백업_${U.today()}.json`, S.exportJSON(), 'application/json'); },
     exportCsv: csvExport,
+    confirmCsvImport() {
+      if (!pendingCsvImport) return;
+      const { valid, invalid } = pendingCsvImport;
+      const existing = new Set(S.data.records.map(r => {
+        const b = S.behavior(r.behaviorId), st = b && S.student(b.studentId);
+        return csvFingerprint({ studentName: st && st.name, behaviorName: b && b.name, ts: r.ts, durationSec: r.durationSec, intensity: r.intensity, abc: r.abc });
+      }));
+      const seen = new Set();
+      let added = 0, skipped = 0;
+      for (const x of valid) {
+        const fp = csvFingerprint(x);
+        if (existing.has(fp) || seen.has(fp)) { skipped++; continue; }
+        seen.add(fp);
+        let st = S.students().find(s => s.name === x.studentName);
+        if (!st) st = S.upsertStudent({ name: x.studentName, grade: '', info: '', notes: '' });
+        let b = S.behaviors(st.id).find(y => y.name === x.behaviorName);
+        if (!b) b = S.upsertBehavior({ studentId: st.id, name: x.behaviorName, definition: '', examples: '', nonExamples: '', measures: ['frequency', 'duration', 'intensity', 'abc'], color: COLORS[S.behaviors(st.id).length % COLORS.length], interventionDate: '', intensityScale: DEFAULT_INTENSITY.slice() });
+        const rec = { behaviorId: b.id, ts: x.ts, source: x.source };
+        if (x.durationSec != null) rec.durationSec = x.durationSec;
+        if (x.intensity != null) rec.intensity = x.intensity;
+        if (x.abc) rec.abc = x.abc;
+        S.addRecord(rec);
+        added++;
+      }
+      pendingCsvImport = null;
+      closeModal(); state.plan = null;
+      toast(`기록 ${added}건 추가${skipped ? ` · 중복 ${skipped}건 제외` : ''}${invalid.length ? ` · 오류 ${invalid.length}건 제외` : ''}`);
+      go('settings');
+    },
     resetData() {
       if (!confirm('모든 학생·표적행동·기록·계획서를 삭제할까요? 되돌릴 수 없습니다.')) return;
       if (!confirm('정말 삭제할까요? 백업하지 않은 자료는 복구할 수 없습니다.')) return;
@@ -1068,6 +1239,12 @@
       render();
     },
     calMetric(el) { state.calMetric = el.value; render(); },
+    importCsv(el) {
+      const file = el.files && el.files[0];
+      if (!file) return;
+      prepareCsvImport(file);
+      el.value = '';
+    },
     importData(el) {
       const file = el.files[0];
       if (!file) return;
